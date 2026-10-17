@@ -24,6 +24,28 @@ contract MockFactory {
     }
 }
 
+/// @notice A factory that answers every call with one 32-byte word, to show the token treats a reply
+/// that is not a clean address as "no distributor" instead of reverting.
+contract DirtyReplyFactory {
+    bytes32 public reply;
+
+    function deploy(address poolManager, uint64 launchNumber) external returns (ShiftToken) {
+        return new ShiftToken(address(this), poolManager, launchNumber);
+    }
+
+    function setReply(bytes32 reply_) external {
+        reply = reply_;
+    }
+
+    function move(ShiftToken token, address to, uint256 amount) external returns (bool) {
+        return token.transfer(to, amount);
+    }
+
+    fallback(bytes calldata) external returns (bytes memory) {
+        return abi.encode(reply);
+    }
+}
+
 /// @notice A factory whose `distributorOf` reverts, to show the token keeps working regardless.
 contract RevertingFactory {
     function deploy(address poolManager, uint64 launchNumber) external returns (ShiftToken) {
@@ -237,18 +259,57 @@ contract ShiftTokenTest is Test {
         assertEq(token.totalSupply(), SUPPLY);
     }
 
-    function test_poolManagerFlowsAreNotTaxedEitherWay() public {
-        // Seed: the factory settles tokens into the pool manager.
+    function test_transfersIntoThePoolManagerAreNotTaxedButPayoutsAre() public {
+        // Seed: the factory settles tokens into the pool manager, whole.
         _fund(POOL_MANAGER, 880_000_000e18);
-        // Buy: the pool manager pays a trader out.
+        assertTrue(token.isExemptRecipient(POOL_MANAGER));
+        assertFalse(token.isLaunchExempt(POOL_MANAGER), "the pool manager is not exempt as a sender");
+
+        // Buy: the pool manager pays a trader out. A `take` is an ordinary payout and is taxed.
+        vm.expectEmit(true, true, true, true, address(token));
+        emit FeeBurned(POOL_MANAGER, ALICE, 10e18);
         vm.prank(POOL_MANAGER);
         token.transfer(ALICE, 1_000e18);
-        assertEq(token.balanceOf(ALICE), 1_000e18, "a buy arrives whole");
-        // Sell: the trader settles tokens back into the pool manager.
+        assertEq(token.balanceOf(ALICE), 990e18, "a buy is taxed like any payout");
+        assertEq(token.balanceOf(POOL_MANAGER), 880_000_000e18 - 1_000e18, "the pool manager is debited the gross");
+        assertEq(token.totalSupply(), SUPPLY - 10e18);
+
+        // Sell: the trader settles exactly what it holds back into the pool manager, whole.
+        vm.prank(ALICE);
+        token.transfer(POOL_MANAGER, 990e18);
+        assertEq(token.balanceOf(ALICE), 0, "the trader sold everything it bought");
+        assertEq(token.balanceOf(POOL_MANAGER), 880_000_000e18 - 10e18, "a sell arrives whole");
+        assertEq(token.totalSupply(), SUPPLY - 10e18, "the sell burned nothing");
+    }
+
+    function test_routingThroughThePoolManagerStillBurnsOnePercent() public {
+        // sync + transfer + settle, then take: the two transfers the token sees when a holder uses
+        // the PoolManager's flash accounting as a hop. The leg out is taxed, so the route is not a
+        // way around the burn.
+        _fund(ALICE, 1_000e18);
+        uint256 supplyBefore = token.totalSupply();
+
         vm.prank(ALICE);
         token.transfer(POOL_MANAGER, 1_000e18);
-        assertEq(token.balanceOf(ALICE), 0);
-        assertEq(token.balanceOf(POOL_MANAGER), 880_000_000e18, "a sell arrives whole");
+        assertEq(token.balanceOf(POOL_MANAGER), 1_000e18, "the leg in arrives whole");
+        vm.prank(POOL_MANAGER);
+        token.transfer(BOB, 1_000e18);
+
+        assertEq(token.balanceOf(BOB), 990e18, "the leg out is taxed");
+        assertEq(token.totalSupply(), supplyBefore - 10e18, "the hop burns what a direct transfer burns");
+    }
+
+    function test_poolManagerPayoutsToLaunchAddressesArriveWhole() public {
+        // The only payouts from the PoolManager that are exempt go to the factory or the distributor,
+        // which are exempt in both directions anyway.
+        factory.setDistributor(LAUNCH_NUMBER, DISTRIBUTOR);
+        _fund(POOL_MANAGER, 1_000e18);
+        vm.prank(POOL_MANAGER);
+        token.transfer(address(factory), 400e18);
+        vm.prank(POOL_MANAGER);
+        token.transfer(DISTRIBUTOR, 600e18);
+        assertEq(token.balanceOf(DISTRIBUTOR), 600e18);
+        assertEq(token.balanceOf(POOL_MANAGER), 0);
         assertEq(token.totalSupply(), SUPPLY);
     }
 
@@ -327,7 +388,63 @@ contract ShiftTokenTest is Test {
         assertEq(other.totalSupply(), SUPPLY - 1e18);
     }
 
+    function test_ordinaryTransfersWorkWhenDistributorReplyIsNotAnAddress() public {
+        DirtyReplyFactory dirty = new DirtyReplyFactory();
+        ShiftToken other = dirty.deploy(POOL_MANAGER, LAUNCH_NUMBER);
+        dirty.move(other, ALICE, 100e18);
+
+        // A word with bits above the 160th set is not an address: no distributor, transfers taxed.
+        dirty.setReply(bytes32(uint256(1) << 200));
+        assertEq(other.launchDistributor(), address(0));
+        vm.prank(ALICE);
+        other.transfer(BOB, 10e18);
+        assertEq(other.balanceOf(BOB), 9.9e18, "the transfer is taxed, not bricked");
+
+        // A clean address in the same slot is honoured.
+        dirty.setReply(bytes32(uint256(uint160(DISTRIBUTOR))));
+        assertEq(other.launchDistributor(), DISTRIBUTOR);
+        assertTrue(other.isLaunchExempt(DISTRIBUTOR));
+        vm.prank(ALICE);
+        other.transfer(DISTRIBUTOR, 10e18);
+        assertEq(other.balanceOf(DISTRIBUTOR), 10e18, "a transfer to the named distributor is whole");
+    }
+
+    function test_ordinaryTransfersWorkWhenDistributorReplyIsShort() public {
+        // A factory answering with fewer than 32 bytes is treated as having no distributor.
+        address shortFactory = address(0xF00D);
+        vm.etch(shortFactory, hex"60016000f3"); // returns 1 byte
+        vm.prank(shortFactory);
+        ShiftToken other = new ShiftToken(shortFactory, POOL_MANAGER, LAUNCH_NUMBER);
+        assertEq(other.launchDistributor(), address(0));
+        vm.prank(shortFactory);
+        other.transfer(ALICE, 100e18);
+        vm.prank(ALICE);
+        other.transfer(BOB, 100e18);
+        assertEq(other.balanceOf(BOB), 99e18);
+    }
+
     // ---------------------------------------------------------------- failures
+
+    function test_burnForIsTotalAndHugeTransfersRevertWithInsufficientBalance() public {
+        assertEq(token.burnFor(type(uint256).max), type(uint256).max / 100, "burnFor never overflows");
+        _fund(ALICE, 1e18);
+
+        vm.prank(ALICE);
+        vm.expectRevert(
+            abi.encodeWithSelector(IERC20Errors.ERC20InsufficientBalance.selector, ALICE, 1e18, type(uint256).max)
+        );
+        token.transfer(BOB, type(uint256).max);
+
+        // The exempt path reports the same error through plain OZ.
+        uint256 huge = type(uint256).max / 100 + 1;
+        vm.prank(address(factory));
+        vm.expectRevert(
+            abi.encodeWithSelector(
+                IERC20Errors.ERC20InsufficientBalance.selector, address(factory), SUPPLY - 1e18, huge
+            )
+        );
+        token.transfer(BOB, huge);
+    }
 
     function test_transferRevertsWhenBalanceIsShortReportingTheGrossAmount() public {
         _fund(ALICE, 500e18);
