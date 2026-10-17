@@ -1,0 +1,24 @@
+{
+  "kind": "custom_token",
+  "token": {
+    "contract": "ShiftToken",
+    "name": "NIGHTSHIFT",
+    "symbol": "SHIFT",
+    "decimals": 18,
+    "constructorArgs": [
+      "$factory",
+      "$poolManager",
+      "$launchNumber"
+    ],
+    "totalSupply": "1000000000000000000000000000"
+  },
+  "contracts": [],
+  "pool": {
+    "pairedCurrency": "0xd34a99bc0f67ae1bbd63c660e6d0b0dd03e263b7",
+    "fee": 12500,
+    "tickSpacing": 60,
+    "initialPrice": "79228162514264337593543950336"
+  },
+  "economics": {"poolBps":8800,"initialMarketCapWei":"2500000000000000000000","remainderTo":"0x83027ad9d0d5374335086c539dadd1db983441b0"},
+  "notes": "ShiftToken mints 1,000,000,000 NIGHTSHIFT (SHIFT), with 18 decimals, once to msg.sender in its constructor. Ordinary transfers and transferFrom burn 1% of the gross SHIFT amount, rounded down to minor units, and credit the remainder to the recipient; transferFrom consumes allowance for the gross amount. Transfers to or from the factory, pool manager, or this launch's distributor are exempt. The distributor is resolved through factory.distributorOf(launchNumber). There are no application contracts, subsequent minting, or administrative controls. The pool pairs with IMD at a 1.25% pool fee. initialPrice records provenance only; the deployer derives the opening price from the initial market cap and total supply."
+}
