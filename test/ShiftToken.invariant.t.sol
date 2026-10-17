@@ -71,8 +71,14 @@ contract ShiftHandler is Test {
         ghostLastSupply = supply;
     }
 
+    /// @dev The burn the spec asks for, written from the addresses rather than the token's own
+    /// exemption helpers: the factory and the named distributor are exempt in both directions, the
+    /// PoolManager only as a recipient, and everything else burns the floor of 1%.
     function _expectedBurn(address from, address to, uint256 amount) internal view returns (uint256) {
-        if (token.isLaunchExempt(from) || token.isLaunchExempt(to)) return 0;
+        address distributor = factory.distributorOf(launchNumber);
+        address f = address(factory);
+        if (from == f || to == f || to == token.POOL_MANAGER()) return 0;
+        if (distributor != address(0) && (from == distributor || to == distributor)) return 0;
         return amount / 100;
     }
 
@@ -136,6 +142,19 @@ contract ShiftHandler is Test {
         _move(spender, owner, to, amount);
         if (infinite) assertEq(token.allowance(owner, spender), type(uint256).max, "infinite allowance is kept");
         else assertEq(token.allowance(owner, spender), 0, "exact allowance is used up");
+    }
+
+    /// @dev A sell into the PoolManager arrives whole and the buy back out of it is taxed, so a round
+    /// trip through the PoolManager costs the same 1% as a direct transfer.
+    function roundTripThroughPoolManager(uint256 actorSeed, uint256 amount) external {
+        address actor = _actor(actorSeed);
+        address pm = token.POOL_MANAGER();
+        if (actor == pm) return;
+        amount = bound(amount, 0, token.balanceOf(actor));
+        uint256 pmBefore = token.balanceOf(pm);
+        _move(actor, actor, pm, amount);
+        assertEq(token.balanceOf(pm), pmBefore + amount, "a sell into the PoolManager arrives whole");
+        _move(pm, pm, actor, amount);
     }
 
     /// @dev A transfer of more than the sender holds reverts and changes nothing.

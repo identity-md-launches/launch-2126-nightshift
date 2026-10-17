@@ -12,7 +12,15 @@ contract ShapedFactory {
         Normal,
         Short,
         Long,
-        Empty
+        Empty,
+        Dirty
+    }
+
+    uint256 public dirtyBits;
+
+    function setDirty(uint256 bits) external {
+        mode = Mode.Dirty;
+        dirtyBits = bits;
     }
 
     Mode public mode;
@@ -36,6 +44,7 @@ contract ShapedFactory {
         if (mode == Mode.Short) return abi.encodePacked(bytes20(distributor));
         if (mode == Mode.Long) return abi.encode(distributor, uint256(123));
         if (mode == Mode.Empty) return "";
+        if (mode == Mode.Dirty) return abi.encode(uint256(uint160(distributor)) | (dirtyBits << 160));
         return abi.encode(distributor);
     }
 }
@@ -120,7 +129,84 @@ contract ShiftTokenEdgeTest is Test {
         assertFalse(token.isLaunchExempt(address(0)));
         assertFalse(token.isLaunchExempt(ALICE));
         assertTrue(token.isLaunchExempt(address(factory)));
-        assertTrue(token.isLaunchExempt(POOL_MANAGER));
+        assertFalse(token.isLaunchExempt(POOL_MANAGER), "the PoolManager is not exempt as a sender");
+        assertTrue(token.isExemptRecipient(POOL_MANAGER));
+        assertFalse(token.isExemptRecipient(address(0)));
+        assertFalse(token.isExemptRecipient(ALICE));
+    }
+
+    /// forge-config: default.fuzz.runs = 1000
+    function testFuzz_dirtyDistributorWordMeansNoDistributor(uint256 bits) public {
+        bits = bound(bits, 1, type(uint96).max);
+        factory.set(ShapedFactory.Mode.Normal, DISTRIBUTOR);
+        factory.setDirty(bits);
+        assertEq(token.launchDistributor(), address(0));
+        assertFalse(token.isLaunchExempt(DISTRIBUTOR));
+        _fund(DISTRIBUTOR, 100e18);
+        vm.prank(DISTRIBUTOR);
+        token.transfer(ALICE, 100e18);
+        assertEq(token.balanceOf(ALICE), 99e18, "taxed as an ordinary account");
+    }
+
+    // ---------------------------------------------------------------- PoolManager is exempt one way
+
+    function test_poolManagerPayoutIsTaxed() public {
+        _fund(POOL_MANAGER, 1_000e18);
+        vm.recordLogs();
+        vm.prank(POOL_MANAGER);
+        token.transfer(ALICE, 1_000e18);
+        assertEq(token.balanceOf(POOL_MANAGER), 0, "debited the gross amount");
+        assertEq(token.balanceOf(ALICE), 990e18, "a buy arrives 1% short");
+        assertEq(token.totalSupply(), SUPPLY - 10e18);
+        assertEq(_countFeeBurned(vm.getRecordedLogs()), 1);
+    }
+
+    function test_poolManagerPayoutToFactoryOrDistributorIsWhole() public {
+        factory.set(ShapedFactory.Mode.Normal, DISTRIBUTOR);
+        _fund(POOL_MANAGER, 200e18);
+        vm.startPrank(POOL_MANAGER);
+        token.transfer(DISTRIBUTOR, 100e18);
+        token.transfer(address(factory), 100e18);
+        vm.stopPrank();
+        assertEq(token.balanceOf(DISTRIBUTOR), 100e18);
+        assertEq(token.totalSupply(), SUPPLY);
+    }
+
+    function test_poolManagerSelfTransferBurnsNothing() public {
+        _fund(POOL_MANAGER, 100e18);
+        vm.prank(POOL_MANAGER);
+        token.transfer(POOL_MANAGER, 100e18);
+        assertEq(token.balanceOf(POOL_MANAGER), 100e18, "a transfer to the PoolManager is exempt");
+        assertEq(token.totalSupply(), SUPPLY);
+    }
+
+    function test_poolManagerAsSpenderStillTaxesOrdinaryHops() public {
+        _fund(ALICE, 100e18);
+        vm.prank(ALICE);
+        token.approve(POOL_MANAGER, 100e18);
+        vm.prank(POOL_MANAGER);
+        token.transferFrom(ALICE, BOB, 100e18);
+        assertEq(token.balanceOf(BOB), 99e18, "exemption is by address, not by caller");
+        assertEq(token.allowance(ALICE, POOL_MANAGER), 0);
+    }
+
+    /// forge-config: default.fuzz.runs = 1000
+    function testFuzz_settleAndTakeCostsTheSameAsADirectTransfer(uint256 amount) public {
+        amount = bound(amount, 0, SUPPLY / 2);
+        _fund(ALICE, amount);
+        _fund(CAROL, amount);
+
+        vm.prank(ALICE);
+        token.transfer(BOB, amount);
+
+        vm.prank(CAROL);
+        token.transfer(POOL_MANAGER, amount);
+        assertEq(token.balanceOf(POOL_MANAGER), amount, "the settle arrives whole");
+        vm.prank(POOL_MANAGER);
+        token.transfer(DISTRIBUTOR, amount); // DISTRIBUTOR is unnamed here: an ordinary account
+
+        assertEq(token.balanceOf(DISTRIBUTOR), token.balanceOf(BOB), "the route through the PoolManager is not cheaper");
+        assertEq(token.balanceOf(BOB), amount - amount / 100);
     }
 
     // ---------------------------------------------------------------- allowance edges
@@ -164,12 +250,30 @@ contract ShiftTokenEdgeTest is Test {
     // ---------------------------------------------------------------- exempt-path failures
 
     function test_exemptSenderCannotOverspend() public {
+        factory.set(ShapedFactory.Mode.Normal, DISTRIBUTOR);
+        _fund(DISTRIBUTOR, 5e18);
+        vm.prank(DISTRIBUTOR);
+        vm.expectRevert(
+            abi.encodeWithSelector(IERC20Errors.ERC20InsufficientBalance.selector, DISTRIBUTOR, 5e18, 5e18 + 1)
+        );
+        token.transfer(ALICE, 5e18 + 1);
+    }
+
+    function test_poolManagerCannotPayOutMoreThanItHolds() public {
         _fund(POOL_MANAGER, 5e18);
         vm.prank(POOL_MANAGER);
         vm.expectRevert(
             abi.encodeWithSelector(IERC20Errors.ERC20InsufficientBalance.selector, POOL_MANAGER, 5e18, 5e18 + 1)
         );
         token.transfer(ALICE, 5e18 + 1);
+        assertEq(token.totalSupply(), SUPPLY);
+    }
+
+    function test_holderCannotSellMoreThanHeldIntoThePoolManager() public {
+        _fund(ALICE, 1e18);
+        vm.prank(ALICE);
+        vm.expectRevert(abi.encodeWithSelector(IERC20Errors.ERC20InsufficientBalance.selector, ALICE, 1e18, 1e18 + 1));
+        token.transfer(POOL_MANAGER, 1e18 + 1);
     }
 
     function test_factoryCannotSendMoreThanItHolds() public {
@@ -235,22 +339,32 @@ contract ShiftTokenEdgeTest is Test {
         assertEq(_countFeeBurned(vm.getRecordedLogs()), 1);
     }
 
-    function test_burnForOverflowsOnlyBeyondAnyReachableAmount() public {
-        // value * 100 overflows above max/100, far beyond the supply: no balance can reach it.
-        assertEq(token.burnFor(type(uint256).max / 100), type(uint256).max / 100 / 100);
-        vm.expectRevert();
-        token.burnFor(type(uint256).max / 100 + 1);
-        assertLt(SUPPLY, type(uint256).max / 100);
+    function test_burnForIsTotalUpToTheMaximum() public view {
+        // mulDiv keeps the full-width product, so the fee is defined for every uint256.
+        assertEq(token.burnFor(type(uint256).max), type(uint256).max / 100);
+        assertEq(token.burnFor(type(uint256).max / 100 + 1), (type(uint256).max / 100 + 1) / 100);
+        assertEq(token.burnFor(0), 0);
+        assertEq(token.burnFor(99), 0);
+        assertEq(token.burnFor(100), 1);
+    }
+
+    function test_maxValueTransferRevertsWithTheGrossAmount() public {
+        _fund(ALICE, 1e18);
+        vm.prank(ALICE);
+        vm.expectRevert(
+            abi.encodeWithSelector(IERC20Errors.ERC20InsufficientBalance.selector, ALICE, 1e18, type(uint256).max)
+        );
+        token.transfer(BOB, type(uint256).max);
     }
 
     // ---------------------------------------------------------------- properties
 
     /// forge-config: default.fuzz.runs = 1000
     function testFuzz_burnForIsFloorOfOnePercent(uint256 value) public view {
-        value = bound(value, 0, type(uint256).max / 100);
         uint256 burned = token.burnFor(value);
-        assertLe(burned * 100, value, "never more than 1%");
-        assertGt((burned + 1) * 100, value, "never less than the floor of 1%");
+        // burned == floor(value / 100), checked without multiplying so it holds up to the maximum.
+        assertEq(burned, value / 100, "the fee is the floor of 1%");
+        assertLe(burned, value);
     }
 
     /// forge-config: default.fuzz.runs = 1000
@@ -258,6 +372,8 @@ contract ShiftTokenEdgeTest is Test {
         factory.set(ShapedFactory.Mode.Normal, DISTRIBUTOR);
         address[3] memory exempt = [address(factory), POOL_MANAGER, DISTRIBUTOR];
         address special = exempt[which % 3];
+        // The PoolManager is exempt only as a recipient; its payouts are covered by the tests above.
+        if (special == POOL_MANAGER) exemptIsSender = false;
         amount = bound(amount, 0, SUPPLY / 2);
         if (special != address(factory)) _fund(special, amount);
         _fund(ALICE, amount);
