@@ -1,0 +1,11 @@
+# Build artifacts
+out/
+cache/
+broadcast/
+
+# Raw OpenZeppelin clone (the sandbox pins its .gitmodules read-only; the
+# vendored copy the project builds against lives in lib/openzeppelin/).
+lib/openzeppelin-contracts/
+
+# Local scratch space; deleted before verification
+test/scratch/
